@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,11 +11,11 @@ import (
 
 func NewCoordinator() *Coordinator {
 	c := &Coordinator{
-		cfg:     make(map[string]int),
 		jobs:    make(chan string, 100),
-		ticks:   make(map[string]chan struct{}),
-		nodes:   make(map[uint32]gen.Drl_ConnectServer),
-		results: make(map[string]map[uint32]float32),
+		cfg:     &sync.Map{},
+		ticks:   &sync.Map{},
+		nodes:   &sync.Map{},
+		results: &sync.Map{},
 	}
 
 	for i := 0; i < 100; i++ {
@@ -25,36 +26,44 @@ func NewCoordinator() *Coordinator {
 
 type Coordinator struct {
 	gen.UnimplementedDrlServer
-	cfg     map[string]int
+	cfg     *sync.Map
 	jobs    chan string
-	ticks   map[string]chan struct{}
-	nodes   map[uint32]gen.Drl_ConnectServer
-	results map[string]map[uint32]float32
+	ticks   *sync.Map
+	nodes   *sync.Map
+	results *sync.Map
 }
 
 func (c *Coordinator) Set(key string, quota int) {
-	_, ok := c.cfg[key]
+	_, ok := c.cfg.Load(key)
 	if !ok {
-		c.ticks[key] = make(chan struct{})
+		c.ticks.Store(key, make(chan struct{}))
 		go c.runLoop(key)
 	}
-	c.cfg[key] = quota
+	c.cfg.Store(key, quota)
 }
 
 func (c *Coordinator) GetQuota(key string) int {
-	return c.cfg[key]
+	v, ok := c.cfg.Load(key)
+	if !ok {
+		return -1
+	}
+	return v.(int)
 }
 
 func (c *Coordinator) runLoop(key string) {
-	ticker := time.NewTicker(time.Millisecond * 100)
+	value, ok := c.ticks.Load(key)
+	if !ok {
+		return
+	}
+	tick := value.(chan struct{})
+	timer := time.NewTicker(time.Millisecond * 100)
 	for {
 		select {
-		case <-ticker.C:
-			c.jobs <- key
-		case <-c.ticks[key]:
-			c.jobs <- key
-			ticker.Reset(0)
+		case <-timer.C:
+		case <-tick:
+			timer.Reset(0)
 		}
+		c.jobs <- key
 	}
 }
 
@@ -67,8 +76,8 @@ func (c *Coordinator) workerLoop() {
 
 func (c *Coordinator) Connect(srv gen.Drl_ConnectServer) error {
 	node := uuid.New()
-	c.nodes[node.ID()] = srv
-	defer delete(c.nodes, node.ID())
+	c.nodes.Store(node.ID(), srv)
+	defer c.nodes.Delete(node.ID())
 
 	for {
 		event, err := srv.Recv()
@@ -78,45 +87,66 @@ func (c *Coordinator) Connect(srv gen.Drl_ConnectServer) error {
 
 		switch event.Type {
 		case gen.EventType_Acquired:
-			c.ticks[event.Key] <- struct{}{}
+			tick, ok := c.ticks.Load(event.Key)
+			if !ok {
+				continue
+			}
+			tick.(chan struct{}) <- struct{}{}
 		case gen.EventType_Quota:
-			c.results[event.Key][node.ID()] = event.Quota / float32(event.Duration.AsDuration()/time.Microsecond)
+			v, ok := c.results.Load(event.Key)
+			if !ok {
+				continue
+			}
+			v.(*sync.Map).Store(node.ID(), event.Quota/float32(event.Duration.AsDuration()/time.Microsecond))
+			c.results.Store(event.Key, v)
 		}
 	}
 }
 
 func (c *Coordinator) Collect(key string) {
-	c.results[key] = make(map[uint32]float32)
+	c.results.Store(key, &sync.Map{})
 
-	for _, nodeSrv := range c.nodes {
-		err := nodeSrv.Send(&gen.Event{
+	c.nodes.Range(func(_, v interface{}) bool {
+		nodeSrv := v.(gen.Drl_ConnectServer)
+		_ = nodeSrv.Send(&gen.Event{
 			Type: gen.EventType_Pull,
 			Key:  key,
 		})
-		if err != nil {
-			continue
-		}
-	}
+		return true
+	})
+
 	time.Sleep(time.Millisecond * 10)
 
 	keyQuota := float32(c.GetQuota(key))
 
 	var count float32
-	for _, weight := range c.results[key] {
-		count += weight
-	}
 
-	for nodeID, nodeSrv := range c.nodes {
-		if _, ok := c.results[key][nodeID]; ok {
-			err := nodeSrv.Send(&gen.Event{
-				Type:     gen.EventType_Quota,
-				Key:      key,
-				Quota:    c.results[key][nodeID] / count * keyQuota,
-				Duration: durationpb.New(time.Millisecond * 100),
-			})
-			if err != nil {
-				continue
-			}
-		}
+	v, ok := c.results.Load(key)
+	if !ok {
+		return
 	}
+	result := v.(*sync.Map)
+
+	result.Range(func(_, v interface{}) bool {
+		count += v.(float32)
+		return true
+	})
+
+	c.nodes.Range(func(k, v interface{}) bool {
+		nodeID := k.(uint32)
+		nodeSrv := v.(gen.Drl_ConnectServer)
+
+		v, ok := result.Load(nodeID)
+		if !ok {
+			return true
+		}
+		weight := v.(float32)
+		_ = nodeSrv.Send(&gen.Event{
+			Type:     gen.EventType_Quota,
+			Key:      key,
+			Quota:    weight / count * keyQuota,
+			Duration: durationpb.New(time.Millisecond * 100),
+		})
+		return true
+	})
 }

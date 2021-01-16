@@ -70,6 +70,10 @@ func (m *MetaBase) update(ctx context.Context) error {
 		}
 		tables := make(map[string]int)
 		tbs := make([]Table, 0)
+		err = resp.ToJSON(&tbs)
+		if err != nil {
+			return err
+		}
 		for _, tb := range tbs {
 			tables[tb.Name.O] = tb.ID
 		}
