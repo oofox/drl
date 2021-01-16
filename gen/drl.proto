@@ -1,0 +1,21 @@
+syntax = "proto3";
+option go_package = "gen";
+
+import "google/protobuf/duration.proto";
+
+enum EventType{
+    Pull = 0;
+    Acquired = 1;
+    Quota = 2;
+}
+
+message Event {
+    EventType type = 1;
+    string key = 2;
+    float quota = 3;
+    google.protobuf.Duration duration = 4;
+}
+
+service drl {
+    rpc connect (stream Event) returns (stream Event) {}
+}
